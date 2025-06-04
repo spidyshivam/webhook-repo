@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>GitHub Repository Changes</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f4f4f4;
+                color: #333;
+            }
+            h1 {
+                color: #444;
+                text-align: center;
+            }
+            #events-container {
+                background-color: #fff;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+                min-height: 100px;
+            }
+            .event-item {
+                padding: 10px;
+                border-bottom: 1px solid #eee;
+                font-size: 0.95em;
+                word-wrap: break-word;
+            }
+            .event-item:last-child {
+                border-bottom: none;
+            }
+            .loading {
+                text-align: center;
+                color: #777;
+                padding: 20px;
+            }
+            .error-message {
+                color: red;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>Latest Repository Changes</h1>
+        <div id="events-container">
+            <div class="loading">Loading events...</div>
+        </div>
+
+        <script>
+            const eventsContainer = document.getElementById("events-container");
+
+            async function fetchEvents() {
+                try {
+                    const response = await fetch("/webhook/events");
+                    if (!response.ok) {
+                        const errorData = await response
+                            .json()
+                            .catch(() => ({
+                                detail: "Failed to parse error response",
+                            }));
+                        throw new Error(
+                            `HTTP error ${response.status}: ${errorData.error || errorData.detail || response.statusText}`,
+                        );
+                    }
+                    const events = await response.json();
+
+                    eventsContainer.innerHTML = "";
+
+                    if (events.length === 0) {
+                        eventsContainer.innerHTML =
+                            '<div class="loading">No events to display yet.</div>';
+                        return;
+                    }
+
+                    events.forEach((event) => {
+                        const eventDiv = document.createElement("div");
+                        eventDiv.classList.add("event-item");
+                        eventDiv.textContent = event.message;
+                        eventsContainer.appendChild(eventDiv);
+                    });
+                } catch (error) {
+                    console.error("Error fetching events:", error);
+                    eventsContainer.innerHTML = `<div class="loading error-message">Failed to load events: ${error.message}. Check console for more details.</div>`;
+                }
+            }
+
+            fetchEvents();
+
+            setInterval(fetchEvents, 15000);
+        </script>
+    </body>
+</html>

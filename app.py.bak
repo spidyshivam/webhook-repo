@@ -1,0 +1,202 @@
+import os
+import hmac
+import hashlib
+from flask import Flask, request, abort, jsonify, render_template
+from pymongo import MongoClient, DESCENDING
+from datetime import datetime, timezone # Added timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# --- Configuration ---
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/github_events")
+client = MongoClient(MONGO_URI)
+db = client.get_database()
+events_collection = db.events
+
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
+
+# --- Helper Functions --- (verify_signature and format_timestamp remain the same)
+def verify_signature(payload_body, signature_header):
+    if not signature_header:
+        return False
+    hash_object = hmac.new(GITHUB_WEBHOOK_SECRET.encode('utf-8'), msg=payload_body, digestmod=hashlib.sha256)
+    expected_signature = "sha256=" + hash_object.hexdigest()
+    return hmac.compare_digest(expected_signature, signature_header)
+
+def format_timestamp(dt_string):
+    if not dt_string:
+        return "N/A"
+    try:
+        # Ensure timezone awareness, assuming 'Z' or offset is present for ISO strings
+        if dt_string.endswith("Z"):
+            dt_object = datetime.fromisoformat(dt_string.replace("Z", "+00:00"))
+        else:
+            dt_object = datetime.fromisoformat(dt_string)
+
+        # Ensure dt_object is timezone-aware UTC for consistent formatting
+        if dt_object.tzinfo is None:
+            dt_object = dt_object.replace(tzinfo=timezone.utc)
+        else:
+            dt_object = dt_object.astimezone(timezone.utc)
+
+        day = dt_object.day
+        if 4 <= day <= 20 or 24 <= day <= 30:
+            suffix = "th"
+        else:
+            suffix = ["st", "nd", "rd"][day % 10 - 1]
+
+        return dt_object.strftime(f"%#d{suffix} %B %Y - %#I:%M %p UTC") # Forcing display as UTC
+    except ValueError as e:
+        app.logger.error(f"Timestamp formatting error: {e} for value '{dt_string}'")
+        return dt_string
+
+# --- Webhook Receiver ---
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    signature_header = request.headers.get('X-Hub-Signature-256')
+    if GITHUB_WEBHOOK_SECRET and not verify_signature(request.data, signature_header):
+        abort(403, "Request signature mismatch")
+
+    event_type = request.headers.get('X-GitHub-Event')
+    payload = request.json
+    event_data = None
+
+    # Get current time in UTC, ensure it's timezone-aware
+    # Replace datetime.utcnow() with datetime.now(timezone.utc)
+    now_utc_iso = datetime.now(timezone.utc).isoformat()
+
+    if event_type == 'push':
+        try:
+            ref = payload.get('ref', '')
+            to_branch = ref.split('/')[-1] if ref else 'N/A'
+            author = payload.get('pusher', {}).get('name', 'N/A')
+            # Use 'committed_date' from head_commit if available, else use the event time.
+            # GitHub's 'timestamp' in head_commit might have local timezone.
+            timestamp = payload.get('head_commit', {}).get('timestamp') if payload.get('head_commit') else now_utc_iso
+            request_id = payload.get('head_commit', {}).get('id') if payload.get('head_commit') else payload.get('after', 'N/A')
+
+            event_data = {
+                'request_id': request_id,
+                'author': author,
+                'action': 'PUSH',
+                'from_branch': None,
+                'to_branch': to_branch,
+                'timestamp': timestamp
+            }
+        except Exception as e:
+            app.logger.error(f"Error processing PUSH event: {e}")
+            return jsonify({'status': 'error', 'message': 'Failed to process PUSH event'}), 500
+
+    elif event_type == 'pull_request':
+        pr_action = payload.get('action')
+        pull_request = payload.get('pull_request', {})
+
+        if pr_action == 'opened':
+            try:
+                author = pull_request.get('user', {}).get('login', 'N/A')
+                from_branch = pull_request.get('head', {}).get('ref', 'N/A')
+                to_branch = pull_request.get('base', {}).get('ref', 'N/A')
+                timestamp = pull_request.get('created_at', now_utc_iso)
+                request_id = str(pull_request.get('id', 'N/A'))
+
+                event_data = {
+                    'request_id': request_id,
+                    'author': author,
+                    'action': 'PULL_REQUEST',
+                    'from_branch': from_branch,
+                    'to_branch': to_branch,
+                    'timestamp': timestamp
+                }
+            except Exception as e:
+                app.logger.error(f"Error processing PULL_REQUEST (opened) event: {e}")
+                return jsonify({'status': 'error', 'message': 'Failed to process PULL_REQUEST event'}), 500
+
+        elif pr_action == 'closed' and pull_request.get('merged'):
+            try:
+                author = pull_request.get('merged_by', {}).get('login') \
+                         or pull_request.get('user', {}).get('login', 'N/A')
+                from_branch = pull_request.get('head', {}).get('ref', 'N/A')
+                to_branch = pull_request.get('base', {}).get('ref', 'N/A')
+                timestamp = pull_request.get('merged_at', now_utc_iso)
+                request_id = pull_request.get('merge_commit_sha', 'N/A')
+
+                event_data = {
+                    'request_id': request_id,
+                    'author': author,
+                    'action': 'MERGE',
+                    'from_branch': from_branch,
+                    'to_branch': to_branch,
+                    'timestamp': timestamp
+                }
+            except Exception as e:
+                app.logger.error(f"Error processing MERGE event (PR closed/merged): {e}")
+                return jsonify({'status': 'error', 'message': 'Failed to process MERGE event'}), 500
+        else:
+            app.logger.info(f"Ignoring pull_request action: {pr_action}")
+            return jsonify({'status': 'ignored', 'message': f'Pull request action {pr_action} not handled'}), 200
+
+    if event_data:
+        try:
+            # Prepare data for MongoDB. MongoDB will generate _id.
+            # The 'request_id' field remains as per your schema.
+            document_to_insert = {
+                'request_id': event_data['request_id'],
+                'author': event_data['author'],
+                'action': event_data['action'],
+                'from_branch': event_data.get('from_branch'),
+                'to_branch': event_data['to_branch'],
+                'timestamp': event_data['timestamp']
+            }
+            # Use insert_one() to create a new document for each event
+            events_collection.insert_one(document_to_insert)
+
+            app.logger.info(f"Stored event: {document_to_insert['action']} by {document_to_insert['author']} (Timestamp: {document_to_insert['timestamp']})")
+            return jsonify({'status': 'success', 'message': 'Webhook received and processed'}), 200
+        except Exception as e:
+            app.logger.error(f"Error storing event to MongoDB: {e}")
+            return jsonify({'status': 'error', 'message': 'Failed to store event'}), 500
+
+    return jsonify({'status': 'ignored', 'message': 'Event type not handled or no data extracted'}), 200
+
+# --- API Endpoint for UI (/events) and UI Route (/) remain the same ---
+@app.route('/events', methods=['GET'])
+def get_events():
+    try:
+        latest_events = list(events_collection.find().sort('timestamp', DESCENDING).limit(20))
+        formatted_events = []
+        for event in latest_events:
+            # Ensure _id is string for JSON, and other fields are present
+            display_event = {
+                '_id': str(event['_id']), # MongoDB's own _id
+                'author': event.get('author', 'N/A'),
+                'action': event.get('action', 'N/A'),
+                'from_branch': event.get('from_branch'),
+                'to_branch': event.get('to_branch', 'N/A'),
+                'timestamp_raw': event.get('timestamp'), # Keep raw timestamp for debugging if needed
+                'timestamp_formatted': format_timestamp(event.get('timestamp'))
+            }
+
+            message = f"Raw: {display_event['action']} by {display_event['author']} on {display_event['timestamp_raw']}" # Fallback/debug
+            if display_event['action'] == 'PUSH':
+                message = f"{display_event['author']} pushed to {display_event['to_branch']} on {display_event['timestamp_formatted']}"
+            elif display_event['action'] == 'PULL_REQUEST':
+                message = f"{display_event['author']} submitted a pull request from {display_event['from_branch']} to {display_event['to_branch']} on {display_event['timestamp_formatted']}"
+            elif display_event['action'] == 'MERGE':
+                message = f"{display_event['author']} merged branch {display_event['from_branch']} to {display_event['to_branch']} on {display_event['timestamp_formatted']}"
+
+            formatted_events.append({'message': message})
+
+        return jsonify(formatted_events)
+    except Exception as e:
+        app.logger.error(f"Error fetching events: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
